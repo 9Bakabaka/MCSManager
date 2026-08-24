@@ -103,6 +103,8 @@ export const searchModsApi = useDefineApi<
 export const getModVersionsApi = useDefineApi<
   {
     params: {
+      daemonId: string;
+      uuid: string;
       projectId: string;
       source?: string;
     };
