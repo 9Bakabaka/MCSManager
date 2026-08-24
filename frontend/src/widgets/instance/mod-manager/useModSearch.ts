@@ -132,6 +132,8 @@ export function useModSearch(
       const { execute } = searchModsApi();
       const res = await execute({
         params: {
+          uuid: instanceId,
+          daemonId: daemonId,
           query: searchFilters.value.query,
           source: searchFilters.value.source,
           version: searchFilters.value.version,
