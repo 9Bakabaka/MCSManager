@@ -15,6 +15,7 @@ export default class FileWriter {
   cwd?: string;
   private releaseLock?: () => Promise<void>;
   private fd: number | null = null;
+  private completion?: Promise<void>;
   readonly received: ChunkRange[] = [];
   lastUpdate: number = Date.now();
 
@@ -104,10 +105,16 @@ export default class FileWriter {
 
     this.addWrittenRange(offset, offset + chunk.length);
     if (this.isFullyCovered()) {
-      this.done().catch((e) => {
-        logger.error("Error completing file upload:", e);
-      }); // async
+      await this.complete();
     }
+  }
+
+  private complete(): Promise<void> {
+    this.completion ||= this.done().catch((error) => {
+      logger.error("Error completing file upload:", error);
+      throw error;
+    });
+    return this.completion;
   }
 
   async done() {
@@ -127,11 +134,15 @@ export default class FileWriter {
     logger.info("Browser Uploaded File:", this.path);
 
     if (this.unzip) {
-      // Statistics of the number of tasks in a single instance file and the number of tasks in the entire daemon process
+      this.startExtraction();
+    }
+  }
 
-      globalEnv.fileTaskCount++;
-      if (this.instance) this.instance.info.fileLock++;
+  private startExtraction(): void {
+    globalEnv.fileTaskCount++;
+    if (this.instance) this.instance.info.fileLock++;
 
+    void (async () => {
       try {
         const instanceFiles = new FileManager(this.cwd);
         await instanceFiles.unzip(this.path, path.dirname(this.path), this.zipCode);
@@ -141,11 +152,13 @@ export default class FileWriter {
           await fs.remove(this.path);
           logger.info("Temporary zip deleted:", this.path);
         }
+      } catch (error) {
+        logger.error("Error extracting uploaded archive:", this.path, error);
       } finally {
         globalEnv.fileTaskCount--;
         if (this.instance) this.instance.info.fileLock--;
       }
-    }
+    })();
   }
 
   async stop() {
@@ -194,7 +207,7 @@ export default class FileWriter {
   /** Complete the upload when no further pieces are expected (e.g. empty files). */
   async completeIfCovered() {
     if (this.fd != null && this.isFullyCovered()) {
-      await this.done();
+      await this.complete();
     }
   }
 
