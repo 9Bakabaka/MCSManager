@@ -2,6 +2,7 @@ import fs from "fs-extra";
 import path from "path";
 import * as lockfile from "proper-lockfile";
 import logger from "../service/log";
+import { $t } from "../i18n";
 import FileManager from "../service/system_file";
 import uploadManager from "../service/upload_manager";
 import { globalEnv } from "./config";
@@ -16,6 +17,10 @@ export default class FileWriter {
   private releaseLock?: () => Promise<void>;
   private fd: number | null = null;
   private completion?: Promise<void>;
+  private pendingWrites = new Set<Promise<void>>();
+  private stopPromise?: Promise<void>;
+  private stopping = false;
+  private ownsFile = false;
   readonly received: ChunkRange[] = [];
   lastUpdate: number = Date.now();
 
@@ -88,20 +93,60 @@ export default class FileWriter {
     }
     try {
       this.fd = await fs.open(this.path, "w+");
+      this.ownsFile = true;
       this.releaseLock = await lockfile.lock(this.path);
       await fs.ftruncate(this.fd, this.size);
     } catch (e) {
-      if (typeof this.releaseLock === "function") await this.releaseLock();
-      this.releaseLock = undefined;
+      try {
+        await this.stop();
+      } catch (cleanupError) {
+        logger.error("Error cleaning failed file upload initialization:", this.path, cleanupError);
+      }
       throw e;
     }
   }
 
   async write(offset: number, chunk: Buffer) {
+    if (this.stopping) throw new Error("File is not opened");
+    const operation = this.writeChunk(offset, chunk);
+    this.pendingWrites.add(operation);
+    operation.catch(() => {
+      this.stopping = true;
+    });
+    try {
+      await operation;
+    } catch (error) {
+      this.pendingWrites.delete(operation);
+      try {
+        await this.stop();
+      } catch (cleanupError) {
+        logger.error("Error cleaning failed file upload:", this.path, cleanupError);
+      }
+      throw error;
+    } finally {
+      this.pendingWrites.delete(operation);
+    }
+  }
+
+  private async writeChunk(offset: number, chunk: Buffer) {
     this.lastUpdate = Date.now();
     if (offset + chunk.length > this.size) throw new Error("Write exceeds file size limit");
-    if (this.fd === null) throw new Error("File is not opened");
-    await fs.write(this.fd, chunk, 0, chunk.length, offset);
+    if (this.stopping || this.fd === null) throw new Error("File is not opened");
+
+    let written = 0;
+    while (written < chunk.length) {
+      const result = await fs.write(
+        this.fd,
+        chunk,
+        written,
+        chunk.length - written,
+        offset + written
+      );
+      if (result.bytesWritten <= 0) {
+        throw new Error($t("TXT_CODE_http_router.updateErr"));
+      }
+      written += result.bytesWritten;
+    }
 
     this.addWrittenRange(offset, offset + chunk.length);
     if (this.isFullyCovered()) {
@@ -162,16 +207,48 @@ export default class FileWriter {
   }
 
   async stop() {
-    if (this.fd != null) {
-      await fs.close(this.fd);
-      this.fd = null;
-      await this.releaseLock!();
+    this.stopping = true;
+    this.stopPromise ||= this.stopInternal();
+    return this.stopPromise;
+  }
+
+  private async stopInternal() {
+    await Promise.allSettled(this.pendingWrites);
+
+    let cleanupError: unknown;
+    const fd = this.fd;
+    this.fd = null;
+    if (fd != null) {
+      try {
+        await fs.close(fd);
+      } catch (error) {
+        cleanupError ||= error;
+      }
+    }
+
+    const releaseLock = this.releaseLock;
+    this.releaseLock = undefined;
+    if (releaseLock) {
+      try {
+        await releaseLock();
+      } catch (error) {
+        cleanupError ||= error;
+      }
+    }
+
+    if (this.ownsFile) {
+      try {
+        await fs.remove(this.path);
+      } catch (error) {
+        cleanupError ||= error;
+      }
     }
     if (this.id != null) {
       uploadManager.delete(this.id);
     }
-    await fs.remove(this.path);
+
     logger.info("Browser Upload Task Stopped:", this.path);
+    if (cleanupError) throw cleanupError;
   }
 
   private addWrittenRange(start: number, end: number): void {
