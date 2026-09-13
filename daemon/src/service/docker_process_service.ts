@@ -12,6 +12,7 @@ import path from "path";
 import { EventEmitter } from "stream";
 import { IInstanceProcess } from "../entity/instance/interface";
 import { $t } from "../i18n";
+import { resolveDockerWorkspacePath } from "../tools/docker_workspace_path";
 import { AsyncTask } from "./async_task_service";
 import logger from "./log";
 import { NetworkLimitService } from "./network_limit_service";
@@ -341,9 +342,7 @@ export class SetupDockerContainer extends AsyncTask {
     let cwd = instance.absoluteCwdPath();
     const defaultInstanceDir = InstanceSubsystem.getInstanceDataDir();
     const hostRealPath = toText(process.env.MCSM_DOCKER_WORKSPACE_PATH);
-    if (hostRealPath && cwd.includes(defaultInstanceDir)) {
-      cwd = path.normalize(path.join(hostRealPath, instance.instanceUuid));
-    }
+    cwd = resolveDockerWorkspacePath(cwd, defaultInstanceDir, hostRealPath);
 
     const mounts: Docker.MountConfig = [];
     for (const v of extraBinds) {
